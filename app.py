@@ -314,6 +314,16 @@ def listing_photo(url):
  except (requests.RequestException,ValueError,TypeError):return None
  return None
 
+IMAGE_HOSTS=('i.ebayimg.com','ebayimg.com','rvb-img.reverb.com','images.reverb.com','cdn.shopify.com','static.wixstatic.com','images.squarespace-cdn.com','preview.redd.it','i.redd.it','img.kleinanzeigen.de','img.leboncoin.fr')
+def allowed_image(url):
+ p=urlparse(url)
+ host=(p.hostname or '').lower()
+ if p.scheme!='https' or not host or not any(host==x or host.endswith('.'+x) for x in IMAGE_HOSTS):return False
+ try:
+  addrs=socket.getaddrinfo(host,443,type=socket.SOCK_STREAM)
+  return bool(addrs) and all(ipaddress.ip_address(a[4][0]).is_global for a in addrs)
+ except (OSError,ValueError):return False
+
 RESULT_CACHE={}
 RESULT_LOCK=threading.Lock()
 CACHE_TTL=900
@@ -345,6 +355,25 @@ class Handler(BaseHTTPRequestHandler):
    self.end_headers();self.wfile.write(blob);return
   if path.path=='/health':
    self.json({'status':'ok'});return
+  if path.path=='/api/photo':
+   src=parse_qs(path.query).get('url',[''])[0]
+   if not allowed_image(src):self.send_error(403);return
+   try:
+    with requests.get(src,headers={'User-Agent':UA,'Accept':'image/avif,image/webp,image/jpeg,image/png,*/*'},timeout=7,allow_redirects=False,stream=True) as response:
+     ct=response.headers.get('Content-Type','').split(';')[0].strip().lower()
+     if response.status_code!=200 or ct not in ('image/jpeg','image/png','image/webp','image/avif'):
+      self.send_error(404);return
+     buffer=bytearray()
+     for chunk in response.iter_content(65536):
+      buffer.extend(chunk)
+      if len(buffer)>3500000:self.send_error(413);return
+     self.send_response(200);self.send_header('Content-Type',ct)
+     self.send_header('Content-Length',str(len(buffer)));self.send_header('Cache-Control','public, max-age=3600')
+     self.end_headers();self.wfile.write(buffer)
+   except (requests.RequestException,BrokenPipeError,ConnectionResetError):
+    try:self.send_error(502)
+    except (BrokenPipeError,ConnectionResetError):pass
+   return
   if path.path=='/api/image':
    url=parse_qs(path.query).get('url',[''])[0]
    with IMAGE_LOCK: cache=IMAGE_CACHE.get(url)
