@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse, parse_qsl, urlencode
-import json, os, re, threading, time, ipaddress, socket
+import json, os, re, threading, time, ipaddress, socket, copy
 import requests
 from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
@@ -86,22 +86,33 @@ def likely_listing(url, title):
  return len(path.strip('/').split('/'))>=1 and len(title)>=8
 
 def direct_ebay(term):
- """Read actual item cards from eBay's public UK search; do not invent results."""
- r=SESSION.get('https://www.ebay.co.uk/sch/i.html',params={'_nkw':term,'LH_ItemCondition':'3000','_sop':'10'},headers=HEADERS,timeout=9)
- r.raise_for_status()
- soup=BeautifulSoup(r.text,'html.parser'); out=[]
- cards=soup.select('li.s-item, .s-card')
- for card in cards[:80]:
-  a=card.select_one('a.s-item__link[href*="/itm/"], a[href*="/itm/"]')
-  if not a: continue
-  heading=card.select_one('.s-item__title, .s-card__title') or a
-  title=heading.get_text(' ',strip=True)
-  price=card.select_one('.s-item__price, .s-card__price')
-  snippet=price.get_text(' ',strip=True) if price else ''
-  img=card.select_one('img.s-item__image-img, img[src], img[data-src]')
-  photo=img.get('data-src') or img.get('src') if img else None
-  if title and title.lower() not in ('shop on ebay','sponsored'):
-   out.append((title,a.get('href',''),snippet,'eBay UK',photo))
+ """Pull individual public UK eBay listings from live pages, with alternate views."""
+ urls=[
+  ('https://www.ebay.co.uk/sch/i.html',{'_nkw':term,'LH_ItemCondition':'3000','_sop':'10'}),
+  ('https://www.ebay.co.uk/sch/i.html',{'_nkw':term,'_sacat':'3858'}),
+  ('https://www.ebay.co.uk/sch/i.html',{'_nkw':term}),
+ ]
+ out=[]; failures=[]
+ for endpoint,params in urls:
+  try:
+   r=SESSION.get(endpoint,params=params,headers=HEADERS,timeout=7)
+   r.raise_for_status()
+   soup=BeautifulSoup(r.text,'html.parser')
+   cards=soup.select('li.s-item, .s-card, div.s-item')
+   for card in cards[:100]:
+    a=card.select_one('a.s-item__link[href*="/itm/"], a[href*="/itm/"]')
+    if not a: continue
+    heading=card.select_one('.s-item__title, .s-card__title') or a
+    title=heading.get_text(' ',strip=True)
+    price=card.select_one('.s-item__price, .s-card__price')
+    snippet=price.get_text(' ',strip=True) if price else ''
+    img=card.select_one('img.s-item__image-img, img[src], img[data-src]')
+    photo=(img.get('data-src') or img.get('src')) if img else None
+    if title and title.lower() not in ('shop on ebay','sponsored'):
+     out.append((title,a.get('href',''),snippet,'eBay UK',photo))
+   if len(out)>=8: break
+  except Exception as e: failures.append(type(e).__name__)
+ if failures: print('EBAY attempts',len(urls),'errors',failures,'returned',len(out),flush=True)
  return out
 
 def direct_reddit(term):
@@ -201,6 +212,8 @@ def search(term, region, site_names, min_price, max_price, used_only):
  queries=make_queries(term,region,site_names)
  engines={'DuckDuckGo':engine_ddg,'Bing':engine_bing,'Bing RSS':engine_bing_rss,'DuckDuckGo Lite':engine_ddg_lite,'SearXNG':engine_searx}
  combined=[]; errors=[]
+ reject={'url':0,'listing':0,'source':0,'term':0,'used':0,'status':0,'price':0}
+ examples=[]
  direct=[]
  with ThreadPoolExecutor(max_workers=12) as pool:
   futures={pool.submit(engines[e],q):(e,q) for e,q in queries}
@@ -224,12 +237,16 @@ def search(term, region, site_names, min_price, max_price, used_only):
  terms=[x.lower() for x in re.findall(r'[a-z0-9]+',term) if len(x)>1]
  for title,url,snippet,engine in combined:
   url=real_url(url); title=' '.join(title.split()); snippet=' '.join(snippet.split())
-  if not url or not likely_listing(url,title):continue
-  if site_names and 'Other independent dealers' not in site_names and not any(SITES[x].split('/')[0] in urlparse(url).netloc for x in site_names if x in SITES and SITES[x]):continue
+  if not url: reject['url']+=1;continue
+  if not likely_listing(url,title):
+   reject['listing']+=1
+   if len(examples)<3:examples.append((site_name(url),title[:65],url[:130]))
+   continue
+  if site_names and 'Other independent dealers' not in site_names and not any(SITES[x].split('/')[0] in urlparse(url).netloc for x in site_names if x in SITES and SITES[x]):reject['source']+=1;continue
   blob=(title+' '+snippet).lower()
-  if terms and not all(t in blob for t in terms):continue
-  if used_only and ('brand new' in blob or ('new condition' in blob and 'used' not in blob)):continue
-  if any(tag in title.lower() for tag in ('sold:', 'sold -', 'sold ', 'withdrawn:', 'wtb:', 'wanted:')) and ('reddit.com' in url or 'thefretboard.co.uk' in url): continue
+  if terms and not all(t in blob for t in terms):reject['term']+=1;continue
+  if used_only and ('brand new' in blob or ('new condition' in blob and 'used' not in blob)):reject['used']+=1;continue
+  if any(tag in title.lower() for tag in ('sold:', 'sold -', 'sold ', 'withdrawn:', 'wtb:', 'wanted:')) and ('reddit.com' in url or 'thefretboard.co.uk' in url):reject['status']+=1;continue
   match=PRICE.search(title+' '+snippet)
   price=match.group(0) if match else None
   numeric=None
@@ -238,14 +255,15 @@ def search(term, region, site_names, min_price, max_price, used_only):
    except ValueError: pass
   # Only filter by numeric price when denomination corresponds to the filter's GBP assumption.
   if numeric is not None and price and ('£' in price or 'GBP' in price.upper()):
-   if min_price is not None and numeric<min_price:continue
-   if max_price is not None and numeric>max_price:continue
+   if min_price is not None and numeric<min_price:reject['price']+=1;continue
+   if max_price is not None and numeric>max_price:reject['price']+=1;continue
   key=(urlparse(url).netloc.lower(),urlparse(url).path.rstrip('/').lower())
   if key not in found:
    found[key]={'title':title,'url':url,'snippet':snippet[:320],'site':site_name(url),'price':price,'engines':[engine], 'photo_endpoint':'/api/image?url='+quote_plus(url), 'image':photo_urls.get(url)}
   elif engine not in found[key]['engines']: found[key]['engines'].append(engine)
  results=list(found.values())
  results.sort(key=lambda x:(-len(x['engines']),-sum(t in x['title'].lower() for t in terms), x['site']))
+ print('DIAGNOSTICS',repr(term),'sites',site_names,'reject',reject,'examples',examples,flush=True)
  return {'results':results[:120], 'total':len(results), 'raw':len(combined), 'warnings':sorted(set(errors)), 'queries':len(queries),'provider_failures':len(errors), 'direct_hits':len(direct)}
 
 # Listing-photo previews are fetched only from explicitly configured public sources.
@@ -275,6 +293,9 @@ def listing_photo(url):
  except (requests.RequestException,ValueError,TypeError):return None
  return None
 
+RESULT_CACHE={}
+RESULT_LOCK=threading.Lock()
+CACHE_TTL=900
 IMAGE_CACHE={}
 IMAGE_LOCK=threading.Lock()
 
@@ -324,7 +345,19 @@ class Handler(BaseHTTPRequestHandler):
     try:return max(0,float(one(k))) if one(k) else None
     except ValueError:return None
    started=time.monotonic()
-   data=search(term,region,sites,price('min'),price('max'),one('used')=='1')
+   cache_key=(term.casefold(),region,tuple(sorted(sites)),one('min'),one('max'),one('used'))
+   with RESULT_LOCK: cached=RESULT_CACHE.get(cache_key)
+   if cached and time.time()-cached[0]<CACHE_TTL and cached[1].get('total'):
+    data=copy.deepcopy(cached[1])
+    data['cached']=True
+   else:
+    data=search(term,region,sites,price('min'),price('max'),one('used')=='1')
+    with RESULT_LOCK:
+     if data['total']>0:
+      if len(RESULT_CACHE)>75:RESULT_CACHE.clear()
+      RESULT_CACHE[cache_key]=(time.time(),copy.deepcopy(data))
+     elif cached and cached[1].get('total'):
+      data=copy.deepcopy(cached[1]);data['cached']=True
    print('SEARCH',repr(term),'raw',data['raw'],'direct',data['direct_hits'],'results',data['total'],'failures',data['provider_failures'],'seconds',round(time.monotonic()-started,1),flush=True)
    self.json(data);return
   self.send_error(404)
