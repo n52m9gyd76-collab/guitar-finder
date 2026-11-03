@@ -85,12 +85,33 @@ def likely_listing(url, title):
  # Independent dealers often have a single product slug.
  return len(path.strip('/').split('/'))>=1 and len(title)>=8
 
+GUITAR_BRANDS = re.compile(r'\\b(?:fender|gibson|epiphone|gretsch|squier|rickenbacker|ibanez|yamaha|teisco|kawai|danelectro|guild|hofner|h[oö]fner|harmony|silvertone|mosrite|burns|vox|eastwood|supro|g&l|prs|paul reed smith|martin|taylor|aria|tokai|fernandes|hagstrom|framus|national|kay|dearmond|washburn|schecter|charvel|jackson|esp|bc rich|music man|ernie ball|godin|duesenberg|duesenburg|samick|peerless|coronado|rivoli)\\b',re.I)
+INSTRUMENT_WORDS = re.compile(r'\\b(?:guitar|guitars|guitare|gitarre|gitaar|chitarra|electric guitar|acoustic guitar|bass guitar|jazzmaster|jaguar|mustang|telecaster|stratocaster|les paul|sg|es-\\d+|semi.?hollow|hollowbody|hollow.body|baritone guitar|bass vi|casino|coronado|rivoli|flying v|firebird|explorer|offset)\\b',re.I)
+NON_INSTRUMENTS = re.compile(r'\\b(?:pickguard|scratchplate|neck only|replacement neck|guitar neck|neck plate|body only|guitar body|loaded body|bridge pickup|neck pickup|pickups? only|pickup set|tuners?|machine heads|tuning pegs|knobs?|pots?|potentiometers?|wiring|control plate|switch tip|hard case|gig bag|soft case|case only|guitar case|strap|strings?|picks?|plectrum|pedals?|amplifier|amp only|sticker|decal|poster|t.?shirt|shirt|instruction|manual|book|blueprint|wall art|photo print|miniature|replica|toy|keyring|keychain|patch|certificate|parts? only|fretboard only|tailpiece|tremolo arm|whammy bar|truss rod|nut blank|pickup cover|guitar stand|wall hanger|repair service|pickup ring|bridge saddle|replacement part|parts for)\\b',re.I)
+GAMBLING = re.compile(r'\\b(?:casino online|online casino|gambling|slots?|roulette|blackjack|poker|jackpot|betting|casino bonus|free spins)\\b',re.I)
+
+def guitar_match(term, title, snippet, url):
+ """Prefer false negatives to showing unrelated products as guitars."""
+ name=re.sub(r'\\s+',' ',title).strip()
+ path=urlparse(url).path.replace('-',' ').replace('_',' ')
+ check=name+' '+path
+ if GAMBLING.search(check):return False
+ if NON_INSTRUMENTS.search(name):return False
+ words=[w.casefold() for w in re.findall(r'[a-z0-9]+',term) if len(w)>1]
+ name_words=re.sub(r'[^a-z0-9]+',' ',check.casefold())
+ if words and not all(re.search(r'(?<![a-z0-9])'+re.escape(w)+r'(?![a-z0-9])',name_words) for w in words):return False
+ if GUITAR_BRANDS.search(name) or re.search(r'\\b(?:guitar|guitare|gitarre|gitaar|chitarra|bass guitar|electric bass|jazzmaster|telecaster|stratocaster|les paul|es-\\d+)\\b',name,re.I):return True
+ # Some vintage instruments have brand only in the shop URL/title metadata.
+ if INSTRUMENT_WORDS.search(name) and ('reverb.com' in url or '/guitar' in path.lower()):return True
+ return False
+
 def direct_ebay(term):
  """Pull individual public UK eBay listings from live pages, with alternate views."""
+ ebay_term=term if re.search(r'\\b(?:guitar|bass)\\b',term,re.I) else term+' guitar'
  urls=[
-  ('https://www.ebay.co.uk/sch/i.html',{'_nkw':term,'LH_ItemCondition':'3000','_sop':'10'}),
-  ('https://www.ebay.co.uk/sch/i.html',{'_nkw':term,'_sacat':'3858'}),
-  ('https://www.ebay.co.uk/sch/i.html',{'_nkw':term}),
+  ('https://www.ebay.co.uk/sch/i.html',{'_nkw':ebay_term,'LH_ItemCondition':'3000','_sop':'10'}),
+  ('https://www.ebay.co.uk/sch/i.html',{'_nkw':ebay_term,'_sacat':'3858'}),
+  ('https://www.ebay.co.uk/sch/i.html',{'_nkw':ebay_term}),
  ]
  out=[]; failures=[]
  for endpoint,params in urls:
@@ -244,7 +265,7 @@ def search(term, region, site_names, min_price, max_price, used_only):
    continue
   if site_names and 'Other independent dealers' not in site_names and not any(SITES[x].split('/')[0] in urlparse(url).netloc for x in site_names if x in SITES and SITES[x]):reject['source']+=1;continue
   blob=(title+' '+snippet).lower()
-  if terms and not all(t in blob for t in terms):reject['term']+=1;continue
+  if not guitar_match(term,title,snippet,url):reject['term']+=1;continue
   if used_only and ('brand new' in blob or ('new condition' in blob and 'used' not in blob)):reject['used']+=1;continue
   if any(tag in title.lower() for tag in ('sold:', 'sold -', 'sold ', 'withdrawn:', 'wtb:', 'wanted:')) and ('reddit.com' in url or 'thefretboard.co.uk' in url):reject['status']+=1;continue
   match=PRICE.search(title+' '+snippet)
@@ -263,7 +284,7 @@ def search(term, region, site_names, min_price, max_price, used_only):
   elif engine not in found[key]['engines']: found[key]['engines'].append(engine)
  results=list(found.values())
  results.sort(key=lambda x:(-len(x['engines']),-sum(t in x['title'].lower() for t in terms), x['site']))
- print('DIAGNOSTICS',repr(term),'sites',site_names,'reject',reject,'examples',examples,flush=True)
+ print('DIAGNOSTICS',repr(term),'sites',site_names,'reject',reject,'examples',examples,'accepted',[(x['title'][:75],x['image'][:70] if x.get('image') else None) for x in results[:5]],flush=True)
  return {'results':results[:120], 'total':len(results), 'raw':len(combined), 'warnings':sorted(set(errors)), 'queries':len(queries),'provider_failures':len(errors), 'direct_hits':len(direct)}
 
 # Listing-photo previews are fetched only from explicitly configured public sources.
