@@ -10,7 +10,18 @@ function sorted(){let data=[...listingData],key=$('#sort').value;if(key==='sourc
 function draw(){let grid=$('#grid');grid.replaceChildren();if(!listingData.length){grid.innerHTML='<div class="empty">No candidate listings surfaced. Try fewer words or open the deeper searches below.</div>';return}const frag=document.createDocumentFragment();for(const item of sorted()){let card=document.createElement('a');card.className='card';card.href=item.url;card.target='_blank';card.rel='noopener noreferrer';let photo=document.createElement('div');photo.className='photo';let fall=document.createElement('div');fall.className='fallback';fall.innerHTML=placeholder+'<span>Photo unavailable</span>';photo.append(fall);let badge=document.createElement('span');badge.className='labelphoto';badge.textContent=item.site;photo.append(badge);let body=document.createElement('div');body.className='cardbody';let price=document.createElement('div');price.className='price';price.textContent=item.price||'See price';let title=document.createElement('h3');title.textContent=item.title;let desc=document.createElement('p');desc.className='desc';desc.textContent=item.snippet||'Open the original listing for more details.';let found=document.createElement('div');found.className='found';found.textContent='Found via '+item.engines.join(' + ');body.append(price,title,desc,found);card.append(photo,body);frag.append(card);item._preview={photo,fall};}grid.append(frag);loadPhotos()}
 const observer='IntersectionObserver'in window?new IntersectionObserver(entries=>{for(let e of entries){if(e.isIntersecting){observer.unobserve(e.target);let item=listingData.find(x=>x._preview?.photo===e.target);if(item)fetchImage(item)}}},{rootMargin:'400px'}):null;
 function loadPhotos(){for(const item of listingData){if(observer)observer.observe(item._preview.photo);else fetchImage(item)}}
-async function fetchImage(item){if((!item.photo_endpoint&&!item.image)||item._requested)return;item._requested=true;try{let d=item.image?{image:item.image}:await (await fetch(item.photo_endpoint)).json();if(d.image&&/^https:\/\//.test(d.image)&&item._preview){let img=new Image();img.loading='lazy';img.referrerPolicy='no-referrer';img.alt=item.title;img.onload=()=>{item._preview.fall.remove();item._preview.photo.insertBefore(img,item._preview.photo.firstChild)};img.src=d.image}}catch(e){}}
+async function fetchImage(item){
+ if((!item.photo_endpoint&&!item.image)||item._requested)return;
+ item._requested=true;
+ try{
+  let d=item.image?{image:item.image}:await (await fetch(item.photo_endpoint)).json();
+  if(!d.image||!/^https:\/\//.test(d.image)||!item._preview)return;
+  let img=new Image();img.loading='lazy';img.alt=item.title;
+  img.onload=()=>{if(item._preview?.fall?.isConnected){item._preview.fall.remove();item._preview.photo.insertBefore(img,item._preview.photo.firstChild)}};
+  img.onerror=()=>{if(!img.dataset.direct){img.dataset.direct='1';img.referrerPolicy='no-referrer';img.src=d.image}};
+  img.src='/api/photo?url='+encodeURIComponent(d.image);
+ }catch(e){}
+}
 function browseCards(q){
  const enc=encodeURIComponent(q), url=(s)=>s+enc;
  const direct=[
