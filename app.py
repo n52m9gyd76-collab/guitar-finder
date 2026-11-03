@@ -204,6 +204,7 @@ IMAGE_CACHE={}
 IMAGE_LOCK=threading.Lock()
 
 STATIC = {
+ '/icons/guitar-finder.svg': ('icons/guitar-finder.svg','image/svg+xml'),
  '/manifest.webmanifest': ('manifest.webmanifest','application/manifest+json'),
  '/sw.js': ('sw.js','text/javascript; charset=utf-8'),
  '/icons/icon-192.png': ('icons/icon-192.png','image/png'),
