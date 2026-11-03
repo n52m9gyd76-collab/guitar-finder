@@ -68,16 +68,55 @@ def site_name(url):
 
 
 def likely_listing(url, title):
- p=urlparse(url); path=p.path.lower(); host=p.netloc.lower()
+ p=urlparse(url)
+ path=p.path.lower()
+ host=p.netloc.lower()
  if not path or path=='/': return False
  if any(i in path for i in IGNORE): return False
- if any(x in host for x in ('youtube.com','pinterest.','wikipedia.org','instagram.com','tiktok.com','amazon.')): return False
+ if any(x in host for x in ('youtube.com','pinterest.','wikipedia.org','instagram.com','tiktok.com','amazon.','google.com','bing.com','duckduckgo.com','search.brave.com')): return False
  if 'reddit.com' in host: return '/comments/' in path
  if 'facebook.com' in host: return '/marketplace/item/' in path
  if 'thefretboard.co.uk' in host: return '/discussion/' in path
- if any(x in host for x in ('reverb.com','ebay.','gumtree.','kleinanzeigen.','leboncoin.','subito.','marktplaats.')):
-  return any(x in path for x in ('/item/','/itm/','/p/','/ad/','/ads/','/s-ad/','/vi/','/v/','/angebote/','/anzeigen/','/a/','/d/','/listing/')) or len(path.strip('/').split('/'))>=2
+ if 'ebay.' in host: return '/itm/' in path
+ if 'reverb.com' in host: return '/item/' in path
+ if 'gumtree.com' in host: return '/p/' in path or '/s-ad/' in path
+ if any(x in host for x in ('kleinanzeigen.','leboncoin.','subito.','marktplaats.')):
+  return len(path.strip('/').split('/'))>=2
+ # Independent dealers often have a single product slug.
  return len(path.strip('/').split('/'))>=1 and len(title)>=8
+
+def direct_ebay(term):
+ """Read actual item cards from eBay's public UK search; do not invent results."""
+ r=SESSION.get('https://www.ebay.co.uk/sch/i.html',params={'_nkw':term,'LH_ItemCondition':'3000','_sop':'10'},headers=HEADERS,timeout=9)
+ r.raise_for_status()
+ soup=BeautifulSoup(r.text,'html.parser'); out=[]
+ cards=soup.select('li.s-item, .s-card')
+ for card in cards[:80]:
+  a=card.select_one('a.s-item__link[href*="/itm/"], a[href*="/itm/"]')
+  if not a: continue
+  heading=card.select_one('.s-item__title, .s-card__title') or a
+  title=heading.get_text(' ',strip=True)
+  price=card.select_one('.s-item__price, .s-card__price')
+  snippet=price.get_text(' ',strip=True) if price else ''
+  img=card.select_one('img.s-item__image-img, img[src], img[data-src]')
+  photo=img.get('data-src') or img.get('src') if img else None
+  if title and title.lower() not in ('shop on ebay','sponsored'):
+   out.append((title,a.get('href',''),snippet,'eBay UK',photo))
+ return out
+
+def direct_reddit(term):
+ """Retrieve public for-sale posts when Reddit allows API access."""
+ r=SESSION.get('https://www.reddit.com/search.json',params={'q':term+' (WTS OR "for sale")','sort':'new','limit':35,'restrict_sr':'false'},headers=HEADERS,timeout=9)
+ r.raise_for_status()
+ out=[]
+ for post in r.json().get('data',{}).get('children',[]):
+  p=post.get('data',{})
+  if p.get('over_18') or p.get('removed_by_category'): continue
+  url='https://www.reddit.com'+p.get('permalink','')
+  photo=p.get('thumbnail','')
+  if not photo.startswith('https://'): photo=None
+  out.append((p.get('title',''),url,p.get('selftext','')[:280],'Reddit',photo))
+ return out
 
 
 def engine_ddg(query):
@@ -162,12 +201,25 @@ def search(term, region, site_names, min_price, max_price, used_only):
  queries=make_queries(term,region,site_names)
  engines={'DuckDuckGo':engine_ddg,'Bing':engine_bing,'Bing RSS':engine_bing_rss,'DuckDuckGo Lite':engine_ddg_lite,'SearXNG':engine_searx}
  combined=[]; errors=[]
+ direct=[]
  with ThreadPoolExecutor(max_workers=12) as pool:
   futures={pool.submit(engines[e],q):(e,q) for e,q in queries}
   for f in as_completed(futures):
    e,q=futures[f]
    try:combined.extend(f.result())
    except Exception as ex:errors.append(f'{e} unavailable: {type(ex).__name__}')
+ # Direct marketplace collectors are supplemental to search engines.
+ with ThreadPoolExecutor(max_workers=2) as direct_pool:
+  providers=[]
+  if not site_names or 'eBay UK' in site_names: providers.append(direct_pool.submit(direct_ebay,term))
+  if not site_names or 'Reddit' in site_names: providers.append(direct_pool.submit(direct_reddit,term))
+  for future in as_completed(providers):
+   try:
+    direct.extend(future.result())
+   except Exception as ex:
+    errors.append('Direct marketplace unavailable: '+type(ex).__name__)
+ combined.extend((title,url,snippet,engine) for title,url,snippet,engine,photo in direct)
+ photo_urls={real_url(url):photo for title,url,snippet,engine,photo in direct if photo and photo.startswith('https://')}
  found={}
  terms=[x.lower() for x in re.findall(r'[a-z0-9]+',term) if len(x)>1]
  for title,url,snippet,engine in combined:
@@ -175,7 +227,7 @@ def search(term, region, site_names, min_price, max_price, used_only):
   if not url or not likely_listing(url,title):continue
   if site_names and 'Other independent dealers' not in site_names and not any(SITES[x].split('/')[0] in urlparse(url).netloc for x in site_names if x in SITES and SITES[x]):continue
   blob=(title+' '+snippet).lower()
-  if terms and sum(t in blob for t in terms)/len(terms)<0.7:continue
+  if terms and not all(t in blob for t in terms):continue
   if used_only and ('brand new' in blob or ('new condition' in blob and 'used' not in blob)):continue
   if any(tag in title.lower() for tag in ('sold:', 'sold -', 'sold ', 'withdrawn:', 'wtb:', 'wanted:')) and ('reddit.com' in url or 'thefretboard.co.uk' in url): continue
   match=PRICE.search(title+' '+snippet)
@@ -190,11 +242,11 @@ def search(term, region, site_names, min_price, max_price, used_only):
    if max_price is not None and numeric>max_price:continue
   key=(urlparse(url).netloc.lower(),urlparse(url).path.rstrip('/').lower())
   if key not in found:
-   found[key]={'title':title,'url':url,'snippet':snippet[:320],'site':site_name(url),'price':price,'engines':[engine], 'photo_endpoint':'/api/image?url='+quote_plus(url)}
+   found[key]={'title':title,'url':url,'snippet':snippet[:320],'site':site_name(url),'price':price,'engines':[engine], 'photo_endpoint':'/api/image?url='+quote_plus(url), 'image':photo_urls.get(url)}
   elif engine not in found[key]['engines']: found[key]['engines'].append(engine)
  results=list(found.values())
  results.sort(key=lambda x:(-len(x['engines']),-sum(t in x['title'].lower() for t in terms), x['site']))
- return {'results':results[:120], 'total':len(results), 'raw':len(combined), 'warnings':sorted(set(errors)), 'queries':len(queries),'provider_failures':len(errors)}
+ return {'results':results[:120], 'total':len(results), 'raw':len(combined), 'warnings':sorted(set(errors)), 'queries':len(queries),'provider_failures':len(errors), 'direct_hits':len(direct)}
 
 # Listing-photo previews are fetched only from explicitly configured public sources.
 # Strict allowed hosts, no redirect following and no local-network targets.
@@ -273,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
     except ValueError:return None
    started=time.monotonic()
    data=search(term,region,sites,price('min'),price('max'),one('used')=='1')
-   print('SEARCH',repr(term),'raw',data['raw'],'results',data['total'],'failures',data['provider_failures'],'seconds',round(time.monotonic()-started,1),flush=True)
+   print('SEARCH',repr(term),'raw',data['raw'],'direct',data['direct_hits'],'results',data['total'],'failures',data['provider_failures'],'seconds',round(time.monotonic()-started,1),flush=True)
    self.json(data);return
   self.send_error(404)
  def json(self,value,status=200):
