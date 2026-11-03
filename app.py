@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse, parse_qsl, url
 import json, os, re, threading, time, ipaddress, socket
 import requests
 from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 
 PORT = int(os.environ.get('PORT', '8765'))
 SEARX_URL = os.environ.get('SEARXNG_URL', '').rstrip('/')
@@ -80,7 +81,7 @@ def likely_listing(url, title):
 
 
 def engine_ddg(query):
- r=SESSION.get('https://html.duckduckgo.com/html/', params={'q':query,'kl':'uk-en'},headers=HEADERS,timeout=12)
+ r=SESSION.get('https://html.duckduckgo.com/html/', params={'q':query,'kl':'uk-en'},headers=HEADERS,timeout=8)
  r.raise_for_status()
  soup=BeautifulSoup(r.text,'html.parser'); out=[]
  for el in soup.select('.result'):
@@ -102,6 +103,28 @@ def engine_bing(query):
  return out
 
 
+
+def engine_bing_rss(query):
+ r=SESSION.get('https://www.bing.com/search',params={'q':query,'format':'rss'},headers=HEADERS,timeout=8)
+ r.raise_for_status()
+ root=ET.fromstring(r.content)
+ out=[]
+ for el in root.findall('.//item'):
+  title=el.findtext('title','')
+  link=el.findtext('link','')
+  desc=BeautifulSoup(el.findtext('description',''),'html.parser').get_text(' ',strip=True)
+  out.append((title,link,desc,'Bing RSS'))
+ return out
+
+def engine_ddg_lite(query):
+ r=SESSION.get('https://lite.duckduckgo.com/lite/',params={'q':query},headers=HEADERS,timeout=8)
+ r.raise_for_status()
+ soup=BeautifulSoup(r.text,'html.parser')
+ out=[]
+ for a in soup.select('a.result-link'):
+  out.append((a.get_text(' ',strip=True),a.get('href',''),'','DuckDuckGo Lite'))
+ return out
+
 def engine_searx(query):
  if not SEARX_URL: return []
  r=SESSION.get(SEARX_URL+'/search',params={'q':query,'format':'json','language':'en-GB'},headers=HEADERS,timeout=12)
@@ -112,13 +135,13 @@ def engine_searx(query):
 def make_queries(term, region, sites):
  regionword={'UK':'(UK OR Britain OR GBP OR £)','EU':'(Europe OR EUR OR €)','both':'(UK OR Europe OR GBP OR EUR)'}.get(region,'')
  words=f'"{term}" guitar for sale {regionword} -review -youtube -pinterest'
- queries=[('DuckDuckGo',words),('Bing',words)]
+ queries=[('DuckDuckGo',words),('Bing',words),('Bing RSS',words),('DuckDuckGo Lite',words)]
  if sites and 'Other independent dealers' not in sites:
   selection=[name for name in sites if name in SITES and SITES[name]]
  else:
   selection=CORE + (EU_MARKETS if region != 'UK' else []) + DEALERS
  # Rotate engines, target small sites individually in batches and include long-tail discovery.
- for i in range(0,len(selection),3):
+ for i in range(0,min(len(selection),21),3):
   batch=selection[i:i+3]
   expr=' OR '.join('site:'+SITES[name] for name in batch)
   queries.append(('DuckDuckGo' if (i//3)%2==0 else 'Bing',f'"{term}" ({expr})'))
@@ -133,13 +156,13 @@ def make_queries(term, region, sites):
  if not sites or 'Facebook Marketplace' in sites:
   queries.append(('DuckDuckGo',f'"{term}" site:facebook.com/marketplace/item/'))
  if SEARX_URL:queries.append(('SearXNG',words))
- return queries[:32]
+ return queries[:16]
 
 def search(term, region, site_names, min_price, max_price, used_only):
  queries=make_queries(term,region,site_names)
- engines={'DuckDuckGo':engine_ddg,'Bing':engine_bing,'SearXNG':engine_searx}
+ engines={'DuckDuckGo':engine_ddg,'Bing':engine_bing,'Bing RSS':engine_bing_rss,'DuckDuckGo Lite':engine_ddg_lite,'SearXNG':engine_searx}
  combined=[]; errors=[]
- with ThreadPoolExecutor(max_workers=9) as pool:
+ with ThreadPoolExecutor(max_workers=12) as pool:
   futures={pool.submit(engines[e],q):(e,q) for e,q in queries}
   for f in as_completed(futures):
    e,q=futures[f]
@@ -171,7 +194,7 @@ def search(term, region, site_names, min_price, max_price, used_only):
   elif engine not in found[key]['engines']: found[key]['engines'].append(engine)
  results=list(found.values())
  results.sort(key=lambda x:(-len(x['engines']),-sum(t in x['title'].lower() for t in terms), x['site']))
- return {'results':results[:120], 'total':len(results), 'raw':len(combined), 'warnings':sorted(set(errors)), 'queries':len(queries)}
+ return {'results':results[:120], 'total':len(results), 'raw':len(combined), 'warnings':sorted(set(errors)), 'queries':len(queries),'provider_failures':len(errors)}
 
 # Listing-photo previews are fetched only from explicitly configured public sources.
 # Strict allowed hosts, no redirect following and no local-network targets.
@@ -207,9 +230,9 @@ STATIC = {
  '/icons/guitar-finder.svg': ('icons/guitar-finder.svg','image/svg+xml'),
  '/manifest.webmanifest': ('manifest.webmanifest','application/manifest+json'),
  '/sw.js': ('sw.js','text/javascript; charset=utf-8'),
- '/icons/icon-192.png': ('icons/icon-192.png','image/png'),
- '/icons/icon-512.png': ('icons/icon-512.png','image/png'),
- '/icons/apple-touch-icon.png': ('icons/apple-touch-icon.png','image/png'),
+ 
+ 
+ 
 }
 
 class Handler(BaseHTTPRequestHandler):
@@ -248,7 +271,9 @@ class Handler(BaseHTTPRequestHandler):
    def price(k):
     try:return max(0,float(one(k))) if one(k) else None
     except ValueError:return None
+   started=time.monotonic()
    data=search(term,region,sites,price('min'),price('max'),one('used')=='1')
+   print('SEARCH',repr(term),'raw',data['raw'],'results',data['total'],'failures',data['provider_failures'],'seconds',round(time.monotonic()-started,1),flush=True)
    self.json(data);return
   self.send_error(404)
  def json(self,value,status=200):
